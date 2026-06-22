@@ -10,6 +10,7 @@ import {
   getKeybindings,
   Input,
   Markdown,
+  matchesKey,
   SelectList,
   Spacer,
   Text,
@@ -18,8 +19,13 @@ import {
 } from '@earendil-works/pi-tui';
 import type { Component, Focusable, SelectItem, TUI } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
+import { getClipboardImage, getClipboardText } from '../../clipboard/index.js';
+import type { ClipboardImage } from '../../clipboard/index.js';
 import { BOX_INDENT, theme, getSelectListTheme, getMarkdownTheme, mastra } from '../theme.js';
 import type { ChatSpacingKind } from './chat-spacing.js';
+
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
 
 export interface PlanApprovalInlineOptions {
   toolCallId: string;
@@ -27,7 +33,7 @@ export interface PlanApprovalInlineOptions {
   plan: string;
   onApprove: () => void;
   onGoal: () => void;
-  onReject: (feedback?: string) => void;
+  onReject: (feedback?: string, images?: ClipboardImage[]) => void;
 }
 
 class PlanContentBox implements Component {
@@ -65,11 +71,14 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
   private feedbackInput?: Input;
   private onApprove?: () => void;
   private onGoal?: () => void;
-  private onReject?: (feedback?: string) => void;
+  private onReject?: (feedback?: string, images?: ClipboardImage[]) => void;
   private resolved = false;
   private mode: 'streaming' | 'select' | 'feedback' = 'select';
   private planTitle: string;
   private planContent: string;
+  private pendingImages: ClipboardImage[] = [];
+  private pendingBracketedPaste: string | null = null;
+  private imageIndicator?: Text;
 
   private _focused = false;
   get focused(): boolean {
@@ -242,8 +251,13 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
   private handleReject(feedback?: string): void {
     if (this.resolved) return;
     this.resolved = true;
-    this.showResult(feedback ? 'Changes requested' : 'Rejected', false, feedback);
-    this.onReject?.(feedback);
+    const images = this.pendingImages.length > 0 ? [...this.pendingImages] : undefined;
+    this.showResult(feedback ? 'Changes requested' : 'Rejected', false, feedback, images);
+    if (images) {
+      this.onReject?.(feedback, images);
+    } else {
+      this.onReject?.(feedback);
+    }
   }
 
   private switchToFeedbackMode(): void {
@@ -268,14 +282,90 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
     };
 
     this.contentBox.addChild(this.feedbackInput);
+    this.imageIndicator = new Text('', 0, 0);
+    this.contentBox.addChild(this.imageIndicator);
     this.contentBox.addChild(new Spacer(1));
-    this.contentBox.addChild(
-      new Text(theme.fg('dim', 'Enter to submit feedback  Esc to reject without feedback'), 0, 0),
-    );
+    this.contentBox.addChild(new Text(theme.fg('dim', 'Enter submit  Esc reject  Ctrl+V paste image'), 0, 0));
+    this.pendingImages = [];
+    this.pendingBracketedPaste = null;
     this.ui.requestRender(true);
   }
 
-  private showResult(status: string, isApproved: boolean, feedback?: string): void {
+  private updateImageIndicator(): void {
+    if (!this.imageIndicator) return;
+    const count = this.pendingImages.length;
+    if (count > 0) {
+      this.imageIndicator.setText(theme.fg('accent', `${count} image${count > 1 ? 's' : ''} attached`));
+    } else {
+      this.imageIndicator.setText('');
+    }
+    this.ui.requestRender();
+  }
+
+  private handleImagePaste(image: ClipboardImage): void {
+    this.pendingImages.push(image);
+    this.updateImageIndicator();
+  }
+
+  private maybeHandleBracketedPaste(data: string): boolean {
+    const pasteStartIndex = this.pendingBracketedPaste ? -1 : data.indexOf(PASTE_START);
+    if (!this.pendingBracketedPaste && pasteStartIndex === -1) {
+      return false;
+    }
+
+    const beforePaste = this.pendingBracketedPaste ? '' : data.slice(0, pasteStartIndex);
+    const pasteChunk = this.pendingBracketedPaste
+      ? `${this.pendingBracketedPaste}${data}`
+      : data.slice(pasteStartIndex);
+
+    if (beforePaste && this.feedbackInput) {
+      this.feedbackInput.handleInput(beforePaste);
+    }
+
+    const pasteEndIndex = pasteChunk.indexOf(PASTE_END);
+    if (pasteEndIndex === -1) {
+      this.pendingBracketedPaste = pasteChunk;
+      return true;
+    }
+
+    this.pendingBracketedPaste = null;
+    const pasteContent = pasteChunk.slice(PASTE_START.length, pasteEndIndex);
+    const afterPaste = pasteChunk.slice(pasteEndIndex + PASTE_END.length);
+
+    if (pasteContent.trim().length === 0) {
+      const clipboardImage = getClipboardImage();
+      if (clipboardImage) {
+        this.handleImagePaste(clipboardImage);
+        if (afterPaste.length > 0) this.handleInput(afterPaste);
+        return true;
+      }
+    }
+
+    // Forward non-image paste content as text input
+    if (this.feedbackInput) {
+      this.feedbackInput.handleInput(`${PASTE_START}${pasteContent}${PASTE_END}`);
+    }
+    if (afterPaste.length > 0) this.handleInput(afterPaste);
+    return true;
+  }
+
+  private handleExplicitPaste(): boolean {
+    const clipboardImage = getClipboardImage();
+    if (clipboardImage) {
+      this.handleImagePaste(clipboardImage);
+      return true;
+    }
+
+    const clipboardText = getClipboardText();
+    if (clipboardText && this.feedbackInput) {
+      this.feedbackInput.handleInput(`${PASTE_START}${clipboardText}${PASTE_END}`);
+      return true;
+    }
+
+    return true;
+  }
+
+  private showResult(status: string, isApproved: boolean, feedback?: string, images?: ClipboardImage[]): void {
     this.contentBox.clear();
 
     const icon = isApproved ? theme.fg('success', '✓') : theme.fg('error', '✗');
@@ -284,12 +374,27 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
     this.contentBox.addChild(new Text(`${icon} ${theme.fg('dim', status)}`, 0, 0));
     this.contentBox.addChild(new Spacer(1));
     this.renderFeedback(feedback);
+    if (images && images.length > 0) {
+      this.contentBox.addChild(
+        new Text(theme.fg('dim', `${images.length} image${images.length > 1 ? 's' : ''} attached`), 0, 0),
+      );
+      this.contentBox.addChild(new Spacer(1));
+    }
   }
 
   handleInput(data: string): void {
     if (this.resolved) return;
 
     if (this.mode === 'feedback' && this.feedbackInput) {
+      if (this.maybeHandleBracketedPaste(data)) {
+        return;
+      }
+
+      if (matchesKey(data, 'ctrl+v') || matchesKey(data, 'alt+v')) {
+        this.handleExplicitPaste();
+        return;
+      }
+
       const kb = getKeybindings();
       if (kb.matches(data, 'tui.select.cancel')) {
         this.handleReject();

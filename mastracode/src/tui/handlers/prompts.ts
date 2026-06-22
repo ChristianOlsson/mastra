@@ -3,6 +3,7 @@
  * tool_suspended (ask_user / request_access / submit_plan).
  */
 import type { AskUserSelectionMode } from '@mastra/core/tools';
+import type { ClipboardImage } from '../../clipboard/index.js';
 import { savePlanToDisk } from '../../utils/plans.js';
 import { AskQuestionDialogComponent } from '../components/ask-question-dialog.js';
 import { AskQuestionInlineComponent } from '../components/ask-question-inline.js';
@@ -321,13 +322,16 @@ export async function handlePlanApproval(
 
         resolve();
       },
-      onReject: async (feedback?: string) => {
+      onReject: async (feedback?: string, images?: ClipboardImage[]) => {
         state.activeInlinePlanApproval = undefined;
         state.ui.setFocus(state.editor);
         await state.session.respondToToolSuspension({
           toolCallId,
           resumeData: { action: 'rejected', feedback },
         });
+        if (images?.length) {
+          ctx.fireMessage(feedback || '', images);
+        }
         resolve();
       },
     };
