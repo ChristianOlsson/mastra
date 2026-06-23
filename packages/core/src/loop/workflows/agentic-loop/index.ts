@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
+import type { ModelMessage, StepResult, ToolSet } from '@internal/ai-sdk-v5';
 import type { MastraDBMessage } from '../../../memory';
 import { InternalSpans } from '../../../observability';
 import { safeEnqueue } from '../../../stream/base';
@@ -15,6 +15,12 @@ import type { LLMIterationData } from '../schema';
 interface AgenticLoopParams<Tools extends ToolSet = ToolSet, OUTPUT = undefined> extends LoopRun<Tools, OUTPUT> {
   controller: ReadableStreamDefaultController<ChunkType<OUTPUT>>;
   outputWriter: OutputWriter;
+}
+
+function getModelMessageContentParts<Tools extends ToolSet>(message: ModelMessage): StepResult<Tools>['content'] {
+  return typeof message.content === 'string'
+    ? [{ type: 'text', text: message.content }]
+    : (message.content as StepResult<Tools>['content']);
 }
 
 export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPUT = undefined>(
@@ -83,6 +89,11 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       const typedInputData = inputData as LLMIterationData<Tools, OUTPUT>;
       let hasFinishedSteps = false;
 
+      const contentBeforeSignalDrain = typedInputData.messages.nonUser.flatMap(message =>
+        getModelMessageContentParts<Tools>(message),
+      );
+      let contentPartCountAfterSignalDrain = contentBeforeSignalDrain.length;
+
       const pendingSignals = _internal.drainPendingSignals?.(runId) ?? [];
       if (pendingSignals.length > 0) {
         messageList.markResponseMessageBoundary(typedInputData.stepResult?.messageId ?? typedInputData.messageId);
@@ -102,6 +113,10 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           user: messageList.get.input.aiV5.model(),
           nonUser: messageList.get.response.aiV5.model(),
         };
+        contentPartCountAfterSignalDrain = typedInputData.messages.nonUser.reduce(
+          (count, message) => count + getModelMessageContentParts<Tools>(message).length,
+          0,
+        );
       }
 
       if (pendingFeedbackStop) {
@@ -109,13 +124,14 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
         pendingFeedbackStop = false;
       }
 
-      const allContent: StepResult<Tools>['content'] = typedInputData.messages.nonUser.flatMap(
-        message => message.content as unknown as StepResult<Tools>['content'],
-      );
-
-      // Only include new content in this step (content added since the previous iteration)
-      const currentContent = allContent.slice(previousContentLength);
-      previousContentLength = allContent.length;
+      // Prefer the execution step's content snapshot. It is anchored to the response length after
+      // input processors/state signals have run, so transcript re-windowing cannot shift it.
+      const currentPayloadStep = typedInputData.output.steps.at(-1);
+      const currentContent = currentPayloadStep?.content?.length
+        ? currentPayloadStep.content
+        : contentBeforeSignalDrain.slice(previousContentLength);
+      const nextPreviousContentLength = Math.max(contentBeforeSignalDrain.length, contentPartCountAfterSignalDrain);
+      previousContentLength = nextPreviousContentLength;
 
       const toolResultParts = currentContent.filter(part => part.type === 'tool-result');
 
@@ -150,6 +166,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       };
 
       accumulatedSteps.push(currentStep);
+      typedInputData.output.steps = accumulatedSteps;
 
       // Only call stopWhen if we're continuing (not on the final step)
       if (rest.stopWhen && typedInputData.stepResult?.isContinued && accumulatedSteps.length > 0) {

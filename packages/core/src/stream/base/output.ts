@@ -663,6 +663,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
               // If step has tripwire, text should be empty (rejected response)
               const stepText = stepTripwire ? '' : self.#bufferedByStep.text;
+              const extractedContent = messageList.get.response.aiV5.modelContent(-1);
+              const stepContent = currentPayloadStep?.content?.length
+                ? currentPayloadStep.content
+                : extractedContent.length
+                  ? extractedContent
+                  : stepText
+                    ? [{ type: 'text' as const, text: stepText }]
+                    : [];
 
               const stepResult: LLMStepResult<OUTPUT> = {
                 stepType: self.#bufferedSteps.length === 0 ? 'initial' : 'tool-result',
@@ -671,7 +679,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 toolCalls: self.#bufferedByStep.toolCalls,
                 toolResults: self.#bufferedByStep.toolResults,
 
-                content: messageList.get.response.aiV5.modelContent(-1),
+                content: stepContent,
                 text: stepText,
                 // Include tripwire data if present
                 tripwire: stepTripwire,

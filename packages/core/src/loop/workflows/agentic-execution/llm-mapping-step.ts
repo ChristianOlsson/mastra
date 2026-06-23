@@ -1,4 +1,4 @@
-import type { ToolSet } from '@internal/ai-sdk-v5';
+import type { ModelMessage, StepResult, ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod/v4';
 import { sanitizeToolName } from '../../../agent/message-list/utils/tool-name';
 import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
@@ -16,6 +16,12 @@ import { createStep } from '../../../workflows/workflow';
 import type { OuterLLMRun } from '../../types';
 import { deserializeToolError } from '../errors';
 import { llmIterationOutputSchema, toolCallOutputSchema } from '../schema';
+
+function getModelMessageContentParts<Tools extends ToolSet>(message: ModelMessage): StepResult<Tools>['content'] {
+  return typeof message.content === 'string'
+    ? [{ type: 'text', text: message.content }]
+    : (message.content as StepResult<Tools>['content']);
+}
 
 export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = undefined>(
   { models, _internal, ...rest }: OuterLLMRun<Tools, OUTPUT>,
@@ -132,6 +138,17 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
     outputSchema: llmIterationOutputSchema,
     execute: async ({ inputData, getStepResult, bail }) => {
       const initialResult = getStepResult(llmExecutionStep);
+
+      const syncCurrentStepContent = () => {
+        const baseline = initialResult.stepResult?.responseContentBaseline;
+        const currentStep = initialResult.output?.steps?.at(-1);
+        if (baseline === undefined || !currentStep) return;
+
+        currentStep.content = rest.messageList.get.response.aiV5
+          .model()
+          .flatMap(message => getModelMessageContentParts<Tools>(message))
+          .slice(baseline);
+      };
 
       /**
        * Compute toModelOutput for a successful tool call and return providerMetadata
@@ -515,6 +532,8 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           _internal._delegationBailed = true;
           rest.requestContext.set('__mastra_delegationBailed', false);
         }
+
+        syncCurrentStepContent();
 
         return {
           ...initialResult,

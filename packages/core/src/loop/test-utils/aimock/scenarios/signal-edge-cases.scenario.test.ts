@@ -1,9 +1,14 @@
+import type { LLMock } from '@copilotkit/aimock';
 import { stepCountIs } from '@internal/ai-sdk-v5';
 import { expect, it } from 'vitest';
+import { z } from 'zod/v4';
 import { MockMemory } from '../../../../memory/mock';
 import { PubSub } from '../../../../events/pubsub';
 import { EventCallback } from '../../../../events/types';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import { createTool } from '../../../../tools';
+import { TaskStateProcessor } from '../../../../tools/builtin/task-state-processor';
+import { taskWriteTool } from '../../../../tools/builtin/task-tools';
+import { createSharedAgent, runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 
 /**
  * Signal edge cases: multiple subscribers, unsubscribe cleanup,
@@ -226,6 +231,389 @@ describeForAllEngines(
 
       // The unsubscribed subscriber should not have received anything
       expect(received).toBe(false);
+    });
+
+    it.each(['sendStateSignal', 'sendSignal', 'sendMessage'] as const)(
+      'does not replay prior tool content into the next step after an in-loop %s',
+      async signalMethod => {
+        const pubsub = new InMemoryPubSub();
+        const mock = getMock();
+        const memory = new MockMemory();
+        const threadId = `signal-slice-thread-${signalMethod}`;
+        const resourceId = `signal-slice-resource-${signalMethod}`;
+        const stepContents: string[] = [];
+        let agent: any;
+        let signalAccepted: Promise<any> | undefined;
+
+        const queueStateTool = createTool({
+          id: 'queue_state',
+          description: 'Queue a signal while the current loop step is still active.',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ queued: z.boolean() }),
+          execute: async () => {
+            if (signalMethod === 'sendStateSignal') {
+              const result = await agent.sendStateSignal(
+                {
+                  id: 'task-list',
+                  cacheKey: 'task-list:v1',
+                  mode: 'snapshot',
+                  contents: 'Task list changed while the first tool step was active',
+                  value: { activeTask: 'prove response slice drift' },
+                },
+                { resourceId, threadId },
+              );
+              signalAccepted = result.accepted;
+            } else if (signalMethod === 'sendSignal') {
+              const result = await agent.sendSignal(
+                { type: 'user-message', contents: 'Follow-up from sendSignal while the first tool step was active' },
+                { resourceId, threadId },
+              );
+              signalAccepted = result.accepted;
+            } else {
+              const result = await agent.sendMessage(
+                { contents: 'Follow-up from sendMessage while the first tool step was active' },
+                { resourceId, threadId },
+              );
+              signalAccepted = result.accepted;
+            }
+            await signalAccepted;
+            return { queued: true };
+          },
+        });
+
+        const sharedAgent = await createSharedAgent(mock, {
+          tools: { queue_state: queueStateTool },
+          memory,
+          pubsub,
+        });
+        agent = sharedAgent.agent;
+
+        const { output, requests } = await runLoopScenario({
+          engine,
+          llm: mock,
+          sharedAgent,
+          prompt: 'Call queue_state, then answer after any signal update.',
+          tools: { queue_state: queueStateTool },
+          stopWhen: stepCountIs(5),
+          pubsub,
+          memory,
+          threadId,
+          resourceId,
+          onStepFinish: ({ content }: any) => {
+            stepContents.push(JSON.stringify(content));
+          },
+          fixtures: llm => {
+            llm.on(
+              { endpoint: 'chat', hasToolResult: false },
+              {
+                toolCalls: [
+                  {
+                    id: 'call_queue_state',
+                    name: 'queue_state',
+                    arguments: {},
+                  },
+                ],
+              },
+            );
+            llm.on(
+              { endpoint: 'chat', hasToolResult: true },
+              { content: 'I saw the queued signal update and finished cleanly.' },
+            );
+          },
+        });
+
+        await expect(signalAccepted).resolves.toMatchObject({ action: 'deliver' });
+        expect(requests).toHaveLength(2);
+
+        expect(stepContents).toHaveLength(2);
+        expect(stepContents[0]).toContain('queue_state');
+        expect(stepContents[0]).toContain('"tool-result"');
+        expect(stepContents[1]).not.toContain('queue_state');
+        expect(stepContents[1]).not.toContain('"tool-result"');
+
+        await expect(output.text).resolves.toContain('finished cleanly');
+      },
+    );
+
+    it('keeps complex mixed content isolated across signal-drained steps', async () => {
+      const pubsub = new InMemoryPubSub();
+      const mock = getMock();
+      const memory = new MockMemory();
+      const threadId = 'complex-signal-slice-thread';
+      const resourceId = 'complex-signal-slice-resource';
+      const stepContents: string[] = [];
+      const stepReasoning: string[] = [];
+      let agent: any;
+      let signalAccepted: Promise<any> | undefined;
+
+      const makeTool = (id: string, resultKey: string) =>
+        createTool({
+          id,
+          description: `Return ${id} data.`,
+          inputSchema: z.object({ value: z.string().optional() }),
+          outputSchema: z.object({ tool: z.string(), value: z.string() }),
+          execute: async ({ value }: { value?: string }) => {
+            if (id === 'mixed_tool_3') {
+              const result = await agent.sendStateSignal(
+                {
+                  id: 'mixed-state',
+                  cacheKey: 'mixed-state:v1',
+                  mode: 'snapshot',
+                  contents: 'Mixed content state changed while tools were active',
+                  value: { activeTool: id },
+                },
+                { resourceId, threadId },
+              );
+              signalAccepted = result.accepted;
+              await signalAccepted;
+            }
+            return { tool: id, value: value ?? resultKey };
+          },
+        });
+
+      const tools = {
+        mixed_tool_1: makeTool('mixed_tool_1', 'one'),
+        mixed_tool_2: makeTool('mixed_tool_2', 'two'),
+        mixed_tool_3: makeTool('mixed_tool_3', 'three'),
+        mixed_tool_4: makeTool('mixed_tool_4', 'four'),
+        mixed_tool_5: makeTool('mixed_tool_5', 'five'),
+        followup_tool_1: makeTool('followup_tool_1', 'six'),
+        followup_tool_2: makeTool('followup_tool_2', 'seven'),
+      };
+
+      const sharedAgent = await createSharedAgent(mock, {
+        tools,
+        memory,
+        pubsub,
+      });
+      agent = sharedAgent.agent;
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: mock,
+        sharedAgent,
+        prompt: 'Use mixed tools, observe any signal, then continue with follow-up tools.',
+        tools,
+        stopWhen: stepCountIs(6),
+        pubsub,
+        memory,
+        threadId,
+        resourceId,
+        onStepFinish: ({ content, reasoningText }: any) => {
+          stepContents.push(JSON.stringify(content));
+          stepReasoning.push(reasoningText || '');
+        },
+        fixtures: (llm: LLMock) => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            {
+              finishReason: 'tool_calls',
+              reasoning: 'First reasoning before mixed tool fanout.',
+              content: 'First text before five tool calls.',
+              toolCalls: [
+                { id: 'call_mixed_1', name: 'mixed_tool_1', arguments: { value: 'one' } },
+                { id: 'call_mixed_2', name: 'mixed_tool_2', arguments: { value: 'two' } },
+                { id: 'call_mixed_3', name: 'mixed_tool_3', arguments: { value: 'three' } },
+                { id: 'call_mixed_4', name: 'mixed_tool_4', arguments: { value: 'four' } },
+                { id: 'call_mixed_5', name: 'mixed_tool_5', arguments: { value: 'five' } },
+              ],
+            },
+          );
+          llm.on(
+            { endpoint: 'chat', hasToolResult: true },
+            {
+              reasoning: 'Second reasoning after signal-drained first tools.',
+              content: 'Second text with all mixed work complete.',
+            },
+          );
+        },
+      });
+
+      await expect(signalAccepted).resolves.toMatchObject({ action: 'deliver' });
+      expect(requests).toHaveLength(2);
+      expect(stepContents).toHaveLength(2);
+      expect(stepReasoning).toHaveLength(2);
+
+      expect(stepContents[0]).toContain('First text before five tool calls.');
+      expect(stepContents[0]).toContain('mixed_tool_1');
+      expect(stepContents[0]).toContain('mixed_tool_5');
+      expect(stepContents[0]).toContain('"tool-result"');
+      expect(stepReasoning[0]).toContain('First reasoning before mixed tool fanout.');
+
+      expect(stepContents[1]).toContain('Second text with all mixed work complete.');
+      expect(stepContents[1]).not.toContain('mixed_tool_1');
+      expect(stepContents[1]).not.toContain('mixed_tool_5');
+      expect(stepContents[1]).not.toContain('"tool-result"');
+      expect(stepReasoning[1]).toContain('Second reasoning after signal-drained first tools.');
+
+      await expect(output.text).resolves.toContain('Second text with all mixed work complete.');
+    });
+
+    it('does not replay prior task_write content into the next step after TaskStateProcessor.computeStateSignal', async () => {
+      const pubsub = new InMemoryPubSub();
+      const mock = getMock();
+      const memory = new MockMemory();
+      const threadId = 'task-state-processor-slice-thread';
+      const resourceId = 'task-state-processor-slice-resource';
+      const stepContents: string[] = [];
+      const tools = { task_write: taskWriteTool };
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: mock,
+        prompt: 'Write a task list, then answer after the task state signal is available.',
+        tools,
+        inputProcessors: [new TaskStateProcessor()],
+        stopWhen: stepCountIs(5),
+        pubsub,
+        memory,
+        threadId,
+        resourceId,
+        onStepFinish: ({ content }: any) => {
+          stepContents.push(JSON.stringify(content));
+        },
+        fixtures: (llm: LLMock) => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            {
+              toolCalls: [
+                {
+                  id: 'call_task_write',
+                  name: 'task_write',
+                  arguments: {
+                    tasks: [
+                      {
+                        id: 'task_probe_processor_state_signal',
+                        content: 'Probe processor state signal slicing',
+                        status: 'in_progress',
+                        activeForm: 'Probing processor state signal slicing',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          );
+          llm.on(
+            { endpoint: 'chat', hasToolResult: true },
+            { content: 'I saw the computed task state signal and finished cleanly.' },
+          );
+        },
+      });
+
+      expect(requests).toHaveLength(2);
+      expect(stepContents).toHaveLength(2);
+      expect(stepContents[0]).toContain('task_write');
+      expect(stepContents[0]).toContain('"tool-result"');
+      expect(stepContents[1]).not.toContain('task_write');
+      expect(stepContents[1]).not.toContain('"tool-result"');
+
+      await expect(output.text).resolves.toContain('finished cleanly');
+    });
+
+    it('keeps visible text across task state signals when prior thread history exists', async () => {
+      const pubsub = new InMemoryPubSub();
+      const mock = getMock();
+      const memory = new MockMemory();
+      const threadId = 'task-state-history-text-drop-thread';
+      const resourceId = 'task-state-history-text-drop-resource';
+      const stepContents: string[] = [];
+      const tools = { task_write: taskWriteTool };
+
+      const seed = await runLoopScenario({
+        engine,
+        llm: mock,
+        prompt: 'Seed prior task history.',
+        tools,
+        inputProcessors: [new TaskStateProcessor()],
+        stopWhen: stepCountIs(5),
+        pubsub,
+        memory,
+        threadId,
+        resourceId,
+        fixtures: (llm: LLMock) => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            {
+              content: 'Prior assistant text that should stay in history but not current step content.',
+              toolCalls: [
+                {
+                  id: 'call_seed_task_write',
+                  name: 'task_write',
+                  arguments: {
+                    tasks: [
+                      {
+                        id: 'task_seed_history',
+                        content: 'Seed prior task history',
+                        status: 'completed',
+                        activeForm: 'Seeding prior task history',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          );
+          llm.on({ endpoint: 'chat', hasToolResult: true }, { content: 'Prior task history was seeded cleanly.' });
+        },
+      });
+
+      mock.clearFixtures();
+      mock.clearRequests();
+      mock.resetMatchCounts();
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: mock,
+        sharedAgent: { agent: seed.agent, mastra: seed.mastra },
+        prompt: 'Write a task, then continue after the computed task state signal.',
+        tools,
+        inputProcessors: [new TaskStateProcessor()],
+        stopWhen: stepCountIs(5),
+        pubsub,
+        memory,
+        threadId,
+        resourceId,
+        onStepFinish: ({ content }: any) => {
+          stepContents.push(JSON.stringify(content));
+        },
+        fixtures: (llm: LLMock) => {
+          llm.onTurn(3, 'Write a task, then continue after the computed task state signal.', {
+            content: 'I will write the task before continuing.',
+            toolCalls: [
+              {
+                id: 'call_task_write_with_text',
+                name: 'task_write',
+                arguments: {
+                  tasks: [
+                    {
+                      id: 'task_probe_history_text_drop',
+                      content: 'Probe task state signal with prior history',
+                      status: 'in_progress',
+                      activeForm: 'Probing task state signal with prior history',
+                    },
+                  ],
+                },
+              },
+            ],
+          });
+          llm.onTurn(5, 'Write a task, then continue after the computed task state signal.', {
+            content: 'I still remember the task-write preamble and finished cleanly.',
+          });
+        },
+      });
+
+      expect(requests).toHaveLength(2);
+      expect(stepContents).toHaveLength(2);
+      expect(stepContents[0]).toContain('I will write the task before continuing.');
+      expect(stepContents[0]).toContain('task_write');
+      expect(stepContents[0]).toContain('"tool-result"');
+      expect(stepContents[0]).not.toContain('Prior assistant text that should stay in history');
+      expect(stepContents[1]).toContain('I still remember the task-write preamble and finished cleanly.');
+      expect(stepContents[1]).not.toContain('task_write');
+      expect(stepContents[1]).not.toContain('"tool-result"');
+
+      await expect(output.text).resolves.toContain('finished cleanly');
     });
 
     it('sendStateSignal with unchanged cacheKey+contents is skipped', async () => {

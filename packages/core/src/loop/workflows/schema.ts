@@ -32,6 +32,7 @@ export interface LLMIterationStepResult {
   headers?: Record<string, string>;
   messageId?: string;
   request?: LanguageModelRequestMetadata;
+  responseContentBaseline?: number;
 }
 
 export interface LLMIterationOutput<Tools extends ToolSet = ToolSet, OUTPUT = undefined> {
@@ -115,6 +116,7 @@ export const llmIterationStepResultSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
   messageId: z.string().optional(),
   request: z.record(z.string(), z.any()).optional(),
+  responseContentBaseline: z.number().optional(),
 });
 
 export const llmIterationOutputSchema = z.object({

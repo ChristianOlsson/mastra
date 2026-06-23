@@ -2,7 +2,7 @@ import { ReadableStream } from 'node:stream/web';
 import { isAbortError } from '@ai-sdk/provider-utils-v5';
 import type { LanguageModelV2Usage } from '@ai-sdk/provider-v5';
 import { APICallError, generateId } from '@internal/ai-sdk-v5';
-import type { CallSettings, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
+import type { CallSettings, ModelMessage, StepResult, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import type { StructuredOutputOptions } from '../../../agent';
 import type { MessageList } from '../../../agent/message-list';
 import { TripWire } from '../../../agent/trip-wire';
@@ -101,9 +101,14 @@ type ProcessOutputStreamResult = {
   collectedChunks: CollectedChunk[];
 };
 
+function getModelMessageContentParts(message: ModelMessage): StepResult<ToolSet>['content'] {
+  return typeof message.content === 'string'
+    ? [{ type: 'text', text: message.content }]
+    : (message.content as StepResult<ToolSet>['content']);
+}
+
 type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   tools?: ToolSet;
-  runId: string;
   messageId: string;
   includeRawChunks?: boolean;
   messageList: MessageList;
@@ -877,6 +882,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       let rawResponse: any;
       let activeFallbackModelIndex = inputData.fallbackModelIndex || 0;
       let executedStepModel: string | undefined;
+      let responseContentBaseline = 0;
       const maxErrorProcessorRetries = maxProcessorRetries ?? (errorProcessors?.length ? 10 : undefined);
       const { outputStream, callBail, runState, stepTools, stepWorkspace, processAPIErrorRetry } =
         await executeStreamWithFallbackModels<{
@@ -1129,6 +1135,10 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               configuredConcurrency: configuredToolCallConcurrency,
             });
           }
+
+          responseContentBaseline = messageList.get.response.aiV5
+            .model()
+            .reduce((count, message) => count + getModelMessageContentParts(message).length, 0);
 
           const runState = new AgenticRunState({
             _internal: _internal!,
@@ -1438,7 +1448,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               outputStream,
               includeRawChunks,
               tools: currentStep.tools,
-              runId,
               messageId: currentStep.messageId,
               messageList,
               runState,
@@ -1951,14 +1960,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       }
 
       const steps = inputData.output?.steps || [];
-
-      // Only include content from this iteration, not all accumulated content
-      // Get the number of existing response messages to know where this iteration starts
-      const existingResponseCount = inputData.messages?.nonUser?.length || 0;
-      const allResponseContent = messageList.get.response.aiV5.modelContent(steps.length);
-
-      // Extract only the content added in this iteration
-      const currentIterationContent = allResponseContent.slice(existingResponseCount);
+      const responseContentForStep = messageList.get.response.aiV5.model().flatMap(getModelMessageContentParts);
+      const currentIterationContent = responseContentForStep.slice(responseContentBaseline);
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded
@@ -2050,6 +2053,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           reason: stepReason,
           warnings,
           isContinued: shouldContinue,
+          responseContentBaseline,
           // Pass retry metadata for tracking
           ...(shouldRetry && processOutputStepTripwire
             ? {
