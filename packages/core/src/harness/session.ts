@@ -2986,7 +2986,7 @@ export class Session<TState = unknown> {
   private async handlePlanApprovalResume({
     toolCallId,
     response,
-    requestContext: _requestContext,
+    requestContext,
   }: {
     toolCallId: string;
     response: { action: 'approved' | 'rejected'; feedback?: string };
